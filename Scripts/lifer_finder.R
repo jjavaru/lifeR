@@ -14,14 +14,15 @@ library(magick)
 
 # Set parameters
 region <- "US" # must use eBird country or state-level regional codes. Examples: "US" (United States), "US-NY" (New York State, USA), "MX-TAM" (Tamaulipas, Mexico). Find state codes in the URL on eBird's regional pages or in Data/ebird_states.rda. Note that "US" is by default modified to only include continental US.
-user <- "Sam Safran" # e.g., "Sam Safran" - this is typically your full name or username. Controls how you are identified in the map caption and is used in output file structure, so can't be empty.
-user_short <- NA # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
-your_ebird_dat <- here("Data", "samsafran", "MyEBirdData.csv") # path to where your personal eBird data are stored
+user <- "Jon Javaruski" # e.g., "Sam Safran" - this is typically your full name or username. Controls how you are identified in the map caption and is used in output file structure, so can't be empty.
+user_short <- "Jon" # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
+your_ebird_dat <- here("ebird_world_life_list.csv") # path to where your personal eBird data are stored
 needs_list_to_use <- "global" # set to "global" if you want to map true lifers (species you haven't observed anywhere); set to "regional" if you'd like to map needs for the specified region.
 resolution <- "27km" # "3km", "9km", or "27km"
 annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "light_blue" # accepted values "light_blue", "dark", "light_green"
+refresh_cache <- FALSE # set to TRUE to ignore any saved caches/checkpoints below and re-hit the eBird API / recompute everything from scratch.
 
 # Make directories to save outputs
 user_file <- tolower(str_replace(user, " ", ""))
@@ -31,13 +32,46 @@ outputDir <- here("Results", user_file, region, needs_list_to_use, resolution)
 subdirectories <- c("Weekly_maps", "Animated_map")
 lapply(file.path(mainDir, user_file, region, needs_list_to_use, resolution, subdirectories), function(x) if (!dir.exists(x)) dir.create(x))
 
+# Cache directories: api_cache holds API responses shared across runs (taxonomy/region species lists);
+# checkpoint_dir holds heavier, run-specific intermediate results (species-to-process list, cropped rasters,
+# weekly summaries) so that a re-run can resume instead of re-downloading/re-computing everything.
+api_cache_dir <- here("Data", "api_cache")
+checkpoint_dir <- file.path(outputDir, "checkpoints")
+dir.create(api_cache_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(checkpoint_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Generic on-disk cache: runs `compute()` only if the cache file doesn't exist yet (or refresh_cache is TRUE),
+# otherwise loads the previously saved result. Used to avoid re-hitting the eBird API / redoing heavy work on rerun.
+with_cache <- function(path, compute, refresh = refresh_cache) {
+  if (!refresh && file.exists(path)) {
+    message("Using cached result: ", path)
+    return(readRDS(path))
+  }
+  result <- compute()
+  saveRDS(result, path)
+  result
+}
+
+# Same idea as with_cache(), but for lists of terra SpatRasters, which need wrap()/unwrap() to serialize.
+with_raster_cache <- function(path, compute, refresh = refresh_cache) {
+  if (!refresh && file.exists(path)) {
+    message("Using cached rasters: ", path)
+    return(lapply(readRDS(path), terra::unwrap))
+  }
+  result <- compute()
+  saveRDS(lapply(result, terra::wrap), path)
+  result
+}
+
 # Save region info in df for later use
 region_info <- data.frame(region = region) %>%
   separate(region, into = c("country", "state"), sep = "-", remove = FALSE)
 
-# Get full eBird taxonomy
-sp_all <- rebird::ebirdtaxonomy("species") %>%
-  rename(Common.Name = comName)
+# Get full eBird taxonomy (cached globally since it doesn't depend on region/user)
+sp_all <- with_cache(file.path(api_cache_dir, "ebird_taxonomy.rds"), function() {
+  rebird::ebirdtaxonomy("species") %>%
+    rename(Common.Name = comName)
+})
 
 # User global life list
 sp_user_all <- read.csv(your_ebird_dat) %>%
@@ -48,11 +82,11 @@ sp_user_all <- read.csv(your_ebird_dat) %>%
 
 # User regional list
 sp_user_region <- read.csv(your_ebird_dat) %>%
-  separate(State.Province, into = c("country", "state"), sep = "-", remove = FALSE) %>%
+  separate(S.P, into = c("country", "state"), sep = "-", remove = FALSE) %>%
   filter(country == region_info$country)
 
 if (!is.na(region_info$state)) {
-  sp_user_region <- filter(sp_user_region, State.Province == region)
+  sp_user_region <- filter(sp_user_region, S.P == region)
 }
 
 sp_user_region <- sp_user_region %>%
@@ -61,10 +95,12 @@ sp_user_region <- sp_user_region %>%
   left_join(sp_all) %>%
   filter(category == "species")
 
-# All species observed in region (by anyone)
-sp_region <- ebirdregionspecies(region) %>%
-  left_join(sp_all) %>%
-  drop_na(Common.Name)
+# All species observed in region (by anyone) - cached per region
+sp_region <- with_cache(file.path(api_cache_dir, paste0("region_species_", region, ".rds")), function() {
+  ebirdregionspecies(region) %>%
+    left_join(sp_all) %>%
+    drop_na(Common.Name)
+})
 
 # User needs in region
 if (needs_list_to_use == "global") {
@@ -85,81 +121,112 @@ if (needs_list_to_use == "regional") {
 sp_ebst <- ebirdst_runs %>%
   rename(Common.Name = common_name)
 
-# All needed species with ebst data
-sp_ebst_for_run <- inner_join(sp_ebst, sp_needed) %>%
-  filter(!species_code %in% c("laugul", "yebsap-example")) # not sure why Laughing Gull is tossing an error
+# All needed species with ebst data (checkpointed - depends on user's life list/region/needs settings)
+sp_ebst_for_run <- with_cache(file.path(checkpoint_dir, "sp_ebst_for_run.rds"), function() {
+  inner_join(sp_ebst, sp_needed) %>%
+    filter(!species_code %in% c("laugul", "yebsap-example")) # not sure why Laughing Gull is tossing an error
+})
 
 # Download occurrence data for needed sp. If annotating we also need species population proportion rasters.
-sapply(sp_ebst_for_run$species_code, ebirdst_download_status,
-  download_abundance = TRUE, download_occurrence = TRUE,
-  pattern =
-    if (annotate == TRUE) {
-      paste0("occurrence_median_", resolution, "|", "proportion-population_median_", resolution)
-    } else {
-      paste0("occurrence_median_", resolution)
-    },
-  USE.NAMES = FALSE
-)
-
-# Load occurrence rasters for all species in species list
-occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
-
-# Load proportion population rasters for all species in species list
-if (annotate == TRUE) {
-  prop_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "proportion-population", period = "weekly", metric = "median", resolution = resolution)
+# ebirdst_download_status() already skips files that were already downloaded on disk, so reruns are cheap,
+# but we still log progress here so it's obvious the script hasn't hung on a long download.
+n_species_to_download <- nrow(sp_ebst_for_run)
+for (i in seq_len(n_species_to_download)) {
+  sp_code <- sp_ebst_for_run$species_code[i]
+  message(sprintf("[%d/%d] Ensuring data downloaded for %s", i, n_species_to_download, sp_code))
+  ebirdst_download_status(sp_code,
+    download_abundance = TRUE, download_occurrence = TRUE,
+    pattern =
+      if (annotate == TRUE) {
+        paste0("occurrence_median_", resolution, "|", "proportion-population_median_", resolution)
+      } else {
+        paste0("occurrence_median_", resolution)
+      }
+  )
 }
-
-# Vector data for region (country/state polygons)
-study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
-if (!is.na(region_info$state)) {
-  study_area <- study_area %>% filter(iso_3166_2 == .env$region)
-}
-if (!region %in% c("US-HI", "US-AK")) {
-  study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
-} # if region is US only mapping continental US
-study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
-mapview::mapview(study_area)
 
 # Define occurrence threshold for when a species is "possible"
 possible_occurrence_threshold <- 0.01 # minimum occurrence probability for a species to be considered "possible" at a given time/location.
 
-# Function used to drop rasters for species that do not meet occ threshold. This is to help save resources by filtering them out and not processing their layers.
-filter_rasters_to_sp_above_threshold <- function(z) {
-  sp_above_occ_threhsold <- sapply(z, minmax) %>%
-    apply(2, max) %>%
-    as.data.frame() %>%
-    rownames_to_column("species_code") %>%
-    rename("max_val" = ".") %>%
-    left_join(sp_ebst_for_run) %>%
-    filter(max_val > possible_occurrence_threshold) %>%
-    pull(species_code)
-  z <- z[names(z) %in% sp_above_occ_threhsold]
-  z
+# Everything below combines the downloaded per-species rasters into cropped/masked rasters for the study
+# area. This is expensive, so it's checkpointed as a group - if it already ran, we load the saved result
+# instead of re-loading/re-cropping every species raster.
+combined_rasters_path <- file.path(checkpoint_dir, "combined_rasters.rds")
+if (!refresh_cache && file.exists(combined_rasters_path)) {
+  message("Using cached cropped rasters: ", combined_rasters_path)
+  cached_combined <- readRDS(combined_rasters_path)
+  occ_crop_combined <- lapply(cached_combined$occ_crop_combined, terra::unwrap)
+  if (annotate == TRUE) prop_crop_combined <- lapply(cached_combined$prop_crop_combined, terra::unwrap)
+  sp_ebst_for_run_in_region <- cached_combined$sp_ebst_for_run_in_region
+  study_area <- cached_combined$study_area
+} else {
+  # Load occurrence rasters for all species in species list
+  occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
+
+  # Load proportion population rasters for all species in species list
+  if (annotate == TRUE) {
+    prop_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "proportion-population", period = "weekly", metric = "median", resolution = resolution)
+  }
+
+  # Vector data for region (country/state polygons)
+  study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
+  if (!is.na(region_info$state)) {
+    study_area <- study_area %>% filter(iso_3166_2 == .env$region)
+  }
+  if (!region %in% c("US-HI", "US-AK")) {
+    study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
+  } # if region is US only mapping continental US
+  study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
+  mapview::mapview(study_area)
+
+  # Function used to drop rasters for species that do not meet occ threshold. This is to help save resources by filtering them out and not processing their layers.
+  filter_rasters_to_sp_above_threshold <- function(z) {
+    sp_above_occ_threhsold <- sapply(z, minmax) %>%
+      apply(2, max) %>%
+      as.data.frame() %>%
+      rownames_to_column("species_code") %>%
+      rename("max_val" = ".") %>%
+      left_join(sp_ebst_for_run) %>%
+      filter(max_val > possible_occurrence_threshold) %>%
+      pull(species_code)
+    z <- z[names(z) %in% sp_above_occ_threhsold]
+    z
+  }
+
+  # Crop the rasters using the vector extent
+  occ_crop_combined <- sapply(occ_combined, terra::crop, y = terra::vect(study_area))
+  occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
+  occ_crop_combined <- sapply(occ_crop_combined, terra::mask, mask = terra::vect(study_area))
+  occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
+  # occ_crop_combined <- sapply(occ_crop_combined, terra::trim)
+
+  if (annotate == TRUE) {
+    prop_crop_combined <- sapply(prop_combined, terra::crop, y = terra::vect(study_area))
+    prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
+    prop_crop_combined <- sapply(prop_crop_combined, terra::mask, mask = terra::vect(study_area))
+    prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
+  }
+
+  # New version of species data frame with only species meeting occ threshold
+  sp_ebst_for_run_in_region <- left_join(
+    x = sapply(occ_crop_combined, minmax) %>%
+      apply(2, max) %>%
+      data.frame() %>%
+      rownames_to_column("species_code") %>%
+      rename("max_val" = "."),
+    y = sp_ebst_for_run
+  )
+
+  saveRDS(
+    list(
+      occ_crop_combined = lapply(occ_crop_combined, terra::wrap),
+      prop_crop_combined = if (annotate == TRUE) lapply(prop_crop_combined, terra::wrap) else NULL,
+      sp_ebst_for_run_in_region = sp_ebst_for_run_in_region,
+      study_area = study_area
+    ),
+    combined_rasters_path
+  )
 }
-
-# Crop the rasters using the vector extent
-occ_crop_combined <- sapply(occ_combined, terra::crop, y = terra::vect(study_area))
-occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-occ_crop_combined <- sapply(occ_crop_combined, terra::mask, mask = terra::vect(study_area))
-occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-# occ_crop_combined <- sapply(occ_crop_combined, terra::trim)
-
-if (annotate == TRUE) {
-  prop_crop_combined <- sapply(prop_combined, terra::crop, y = terra::vect(study_area))
-  prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
-  prop_crop_combined <- sapply(prop_crop_combined, terra::mask, mask = terra::vect(study_area))
-  prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
-}
-
-# New version of species data frame with only species meeting occ threshold
-sp_ebst_for_run_in_region <- left_join(
-  x = sapply(occ_crop_combined, minmax) %>%
-    apply(2, max) %>%
-    data.frame() %>%
-    rownames_to_column("species_code") %>%
-    rename("max_val" = "."),
-  y = sp_ebst_for_run
-)
 
 # Function for viewing summarized species rasters (not run)
 view_sp <- function(x) {
@@ -168,20 +235,25 @@ view_sp <- function(x) {
 }
 # view_sp("casspa")
 
-# Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each week stored as a single-layer SpatRaster in a list.
-possible_lifers <- list()
-for (i in 1:52) {
-  week_slice <- lapply(occ_crop_combined, subset, subset = i)
-  week_slice <- rast(week_slice)
-  week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
-  week_slice <- sum(week_slice, na.rm = TRUE)
-  possible_lifers[[i]] <- week_slice
-}
+# Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each
+# week stored as a single-layer SpatRaster in a list. This is checkpointed since it's a heavy per-week loop.
+possible_lifers <- with_raster_cache(file.path(checkpoint_dir, "possible_lifers.rds"), function() {
+  possible_lifers <- list()
+  for (i in 1:52) {
+    message(sprintf("Summarizing week %d/52", i))
+    week_slice <- lapply(occ_crop_combined, subset, subset = i)
+    week_slice <- rast(week_slice)
+    week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
+    week_slice <- sum(week_slice, na.rm = TRUE)
+    possible_lifers[[i]] <- week_slice
+  }
 
-# Reproject, mask, and trim weekly lifer count rasters for plotting
-possible_lifers <- sapply(possible_lifers, terra::project, y = "epsg:5070", method = "near")
-possible_lifers <- sapply(possible_lifers, terra::mask, mask = project(vect(study_area), y = "epsg:5070"))
-possible_lifers <- sapply(possible_lifers, trim)
+  # Reproject, mask, and trim weekly lifer count rasters for plotting
+  possible_lifers <- sapply(possible_lifers, terra::project, y = "epsg:5070", method = "near")
+  possible_lifers <- sapply(possible_lifers, terra::mask, mask = project(vect(study_area), y = "epsg:5070"))
+  possible_lifers <- sapply(possible_lifers, trim)
+  possible_lifers
+})
 
 # For each species and each week get point of highest abundance and add to an sf dataframe (for annotations)
 if (annotate == TRUE) {
