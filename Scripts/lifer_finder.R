@@ -23,6 +23,8 @@ annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "light_blue" # accepted values "light_blue", "dark", "light_green"
 refresh_cache <- FALSE # set to TRUE to ignore any saved caches/checkpoints below and re-hit the eBird API / recompute everything from scratch.
+n_weeks <- 52 # number of weeks (1-52, starting from week 1) to process. Set to 52 for the full year/animated map. Lower values drastically cut memory use since rasters are subset to these weeks before the expensive crop/mask/summarize steps.
+force_download_check <- FALSE
 
 # Make directories to save outputs
 user_file <- tolower(str_replace(user, " ", ""))
@@ -128,11 +130,36 @@ sp_ebst_for_run <- with_cache(file.path(checkpoint_dir, "sp_ebst_for_run.rds"), 
 })
 
 # Download occurrence data for needed sp. If annotating we also need species population proportion rasters.
-# ebirdst_download_status() already skips files that were already downloaded on disk, so reruns are cheap,
-# but we still log progress here so it's obvious the script hasn't hung on a long download.
+# ebirdst_download_status() itself skips files that are already on disk, but it still makes a slow remote
+# API call per species just to check - with hundreds of species this check alone can take a long time.
+# force_download_check <- TRUE bypasses the local-file shortcut below and always hits the API, e.g. if a
+# previous download was interrupted and you're not sure what's actually complete on disk.
+ebirdst_version_year <- ebirdst_version()[["status_version_year"]]
+
+# TRUE if the files needed for sp_code at `resolution` (and, if annotating, the proportion-population
+# layer too) already exist locally, so the slow API check can be skipped for that species.
+species_files_present <- function(sp_code) {
+  sp_dir <- file.path(ebirdst_data_dir(), ebirdst_version_year, sp_code, "weekly")
+  occ_file <- file.path(sp_dir, paste0(sp_code, "_occurrence_median_", resolution, "_", ebirdst_version_year, ".tif"))
+  if (!file.exists(occ_file)) {
+    return(FALSE)
+  }
+  if (annotate == TRUE) {
+    prop_file <- file.path(sp_dir, paste0(sp_code, "_proportion-population_median_", resolution, "_", ebirdst_version_year, ".tif"))
+    if (!file.exists(prop_file)) {
+      return(FALSE)
+    }
+  }
+  TRUE
+}
+
 n_species_to_download <- nrow(sp_ebst_for_run)
 for (i in seq_len(n_species_to_download)) {
   sp_code <- sp_ebst_for_run$species_code[i]
+  if (!force_download_check && species_files_present(sp_code)) {
+    message(sprintf("[%d/%d] Already downloaded, skipping check for %s", i, n_species_to_download, sp_code))
+    next
+  }
   message(sprintf("[%d/%d] Ensuring data downloaded for %s", i, n_species_to_download, sp_code))
   ebirdst_download_status(sp_code,
     download_abundance = TRUE, download_occurrence = TRUE,
@@ -151,7 +178,7 @@ possible_occurrence_threshold <- 0.01 # minimum occurrence probability for a spe
 # Everything below combines the downloaded per-species rasters into cropped/masked rasters for the study
 # area. This is expensive, so it's checkpointed as a group - if it already ran, we load the saved result
 # instead of re-loading/re-cropping every species raster.
-combined_rasters_path <- file.path(checkpoint_dir, "combined_rasters.rds")
+combined_rasters_path <- file.path(checkpoint_dir, paste0("combined_rasters_", n_weeks, "wk.rds"))
 if (!refresh_cache && file.exists(combined_rasters_path)) {
   message("Using cached cropped rasters: ", combined_rasters_path)
   cached_combined <- readRDS(combined_rasters_path)
@@ -162,10 +189,13 @@ if (!refresh_cache && file.exists(combined_rasters_path)) {
 } else {
   # Load occurrence rasters for all species in species list
   occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
+  # POC: immediately drop to the first n_weeks layers so the heavy crop/mask/summarize steps below only ever hold n_weeks worth of data in memory
+  occ_combined <- sapply(occ_combined, terra::subset, subset = 1:n_weeks)
 
   # Load proportion population rasters for all species in species list
   if (annotate == TRUE) {
     prop_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "proportion-population", period = "weekly", metric = "median", resolution = resolution)
+    prop_combined <- sapply(prop_combined, terra::subset, subset = 1:n_weeks)
   }
 
   # Vector data for region (country/state polygons)
@@ -237,10 +267,10 @@ view_sp <- function(x) {
 
 # Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each
 # week stored as a single-layer SpatRaster in a list. This is checkpointed since it's a heavy per-week loop.
-possible_lifers <- with_raster_cache(file.path(checkpoint_dir, "possible_lifers.rds"), function() {
+possible_lifers <- with_raster_cache(file.path(checkpoint_dir, paste0("possible_lifers_", n_weeks, "wk.rds")), function() {
   possible_lifers <- list()
-  for (i in 1:52) {
-    message(sprintf("Summarizing week %d/52", i))
+  for (i in 1:n_weeks) {
+    message(sprintf("Summarizing week %d/%d", i, n_weeks))
     week_slice <- lapply(occ_crop_combined, subset, subset = i)
     week_slice <- rast(week_slice)
     week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
@@ -319,7 +349,7 @@ legend_breaks_last <- last(legend_breaks)
 # Generate and save map for each week.
 week_plots_possible <- list()
 for (i in 1:length(possible_lifers)) {
-  date <- occ_crop_combined[[1]]@cpp[["names"]][i]
+  date <- terra::names(occ_crop_combined[[1]])[i]
   if (needs_list_to_use == "global") {
     legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " potential lifers")
   }
@@ -395,16 +425,27 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
   week_plots_possible[[i]] <- week_plot
 }
 
-# Generate animated gif (full size and smaller for sharing)
+# Generate a low-resolution GIF and a high-resolution MP4.
+# The MP4 is encoded directly from the JPG sequence so frames do not all need to live in magick memory.
 imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
-img_joined <- image_join(lapply(imgs, image_read))
-if (annotate == TRUE) {img_animated <- image_animate(img_joined, fps = .5)}
-if (annotate == FALSE) {img_animated <- image_animate(img_joined, fps = 5)}
-if (annotate == TRUE) { image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_annotated_", user_file, ".gif"))}
-if (annotate == FALSE) {image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_", user_file, ".gif"))}
-image_write(image = img_animated, path = image_path)
-hires <- image_read(image_path)
-lores <- image_scale(hires, geometry_size_percent(width = 38, height = NULL))
+
+lores_frames <- image_join(lapply(imgs, function(f) image_scale(image_read(f), geometry_size_percent(width = 38, height = NULL))))
+if (annotate == TRUE) {img_animated_lores <- image_animate(lores_frames, fps = .5)}
+if (annotate == FALSE) {img_animated_lores <- image_animate(lores_frames, fps = 5)}
 if (annotate == TRUE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_lores_annotated_", user_file, ".gif"))}
 if (annotate == FALSE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_lores_", user_file, ".gif"))}
-image_write(image = lores, path = image_path_lores)
+image_write(image = img_animated_lores, path = image_path_lores)
+rm(lores_frames, img_animated_lores)
+gc()
+
+if (!requireNamespace("av", quietly = TRUE)) {
+  stop("The av package is required to create the hi-res MP4. On Debian/Ubuntu install libavfilter-dev, libavcodec-dev, libavformat-dev, libavutil-dev, libswscale-dev, and libavdevice-dev, then run install.packages('av').")
+}
+if (annotate == TRUE) {image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_annotated_", user_file, ".mp4"))}
+if (annotate == FALSE) {image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_", user_file, ".mp4"))}
+if (annotate == TRUE) {fps <- .5}
+if (annotate == FALSE) {fps <- 5}
+av::av_encode_video(
+  input = imgs, output = image_path, framerate = fps,
+  vfilter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+)
