@@ -12,27 +12,33 @@ library(rnaturalearthhires)
 library(tidyterra)
 library(magick)
 
+central_america <- c("MX", "BZ", "GT", "SV", "HN", "NI", "CR", "PA")
+southwest_us <- c("US-AZ", "US-NM", "US-TX")
+
 # Set parameters
-region <- "US" # must use eBird country or state-level regional codes. Examples: "US" (United States), "US-NY" (New York State, USA), "MX-TAM" (Tamaulipas, Mexico). Find state codes in the URL on eBird's regional pages or in Data/ebird_states.rda. Note that "US" is by default modified to only include continental US.
+region <- southwest_us # eBird country or state-level regional code(s), e.g. "US", "US-NY", or a vector such as central_america or southwest_us above. Note that "US" is by default modified to only include continental US.
 user <- "Jon Javaruski" # e.g., "Sam Safran" - this is typically your full name or username. Controls how you are identified in the map caption and is used in output file structure, so can't be empty.
 user_short <- "Jon" # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
 your_ebird_dat <- here("ebird_world_life_list.csv") # path to where your personal eBird data are stored
 needs_list_to_use <- "global" # set to "global" if you want to map true lifers (species you haven't observed anywhere); set to "regional" if you'd like to map needs for the specified region.
-resolution <- "27km" # "3km", "9km", or "27km"
+resolution <- "9km" # "3km", "9km", or "27km"
 annotate <- FALSE # If set to TRUE, needed species are labeled on the map at the location where they have the highest abundance each week. This makes the animated map look pretty bad (so it gets output at a much slower frame rate to compensate), but may be of interest to some. the "dark" color theme works best for this.
 sp_annotation_threshold <- 0.01 # this controls how many species get annotated on the map if annotate is set to TRUE. A species will only be annotated if the grid cell where it is most abundant contains more than the set proportion of the total population. Lower values mean more species get annotated (though the marked locations will hold smaller and smaller percentages of the total population, which may make for some odd placements for widely dispersed species). Set to 0 to annotate all needed species. A value of 0.01 seems to keep things under control if there are many needed species. Note that this is different from the possible_occurrence_threshold, which sets the occurrence probability a species must exceed in a cell to be counted as a potential lifer.
 theme <- "light_blue" # accepted values "light_blue", "dark", "light_green"
 refresh_cache <- FALSE # set to TRUE to ignore any saved caches/checkpoints below and re-hit the eBird API / recompute everything from scratch.
 n_weeks <- 52 # number of weeks (1-52, starting from week 1) to process. Set to 52 for the full year/animated map. Lower values drastically cut memory use since rasters are subset to these weeks before the expensive crop/mask/summarize steps.
 force_download_check <- FALSE
+download_abundance <- FALSE # set to TRUE only if abundance rasters are needed; this map uses occurrence rasters.
+
+region_id <- paste(region, collapse = "_")
 
 # Make directories to save outputs
 user_file <- tolower(str_replace(user, " ", ""))
 mainDir <- here("Results")
-dir.create(file.path(mainDir, user_file, region, needs_list_to_use, resolution), recursive = TRUE, showWarnings = TRUE)
-outputDir <- here("Results", user_file, region, needs_list_to_use, resolution)
+dir.create(file.path(mainDir, user_file, region_id, needs_list_to_use, resolution), recursive = TRUE, showWarnings = TRUE)
+outputDir <- here("Results", user_file, region_id, needs_list_to_use, resolution)
 subdirectories <- c("Weekly_maps", "Animated_map")
-lapply(file.path(mainDir, user_file, region, needs_list_to_use, resolution, subdirectories), function(x) if (!dir.exists(x)) dir.create(x))
+lapply(file.path(mainDir, user_file, region_id, needs_list_to_use, resolution, subdirectories), function(x) if (!dir.exists(x)) dir.create(x))
 
 # Cache directories: api_cache holds API responses shared across runs (taxonomy/region species lists);
 # checkpoint_dir holds heavier, run-specific intermediate results (species-to-process list, cropped rasters,
@@ -66,8 +72,11 @@ with_raster_cache <- function(path, compute, refresh = refresh_cache) {
 }
 
 # Save region info in df for later use
-region_info <- data.frame(region = region) %>%
-  separate(region, into = c("country", "state"), sep = "-", remove = FALSE)
+region_info <- tibble(
+  region = region,
+  country = sub("-.*$", "", region),
+  state = if_else(str_detect(region, "-"), sub("^[^-]*-", "", region), NA_character_)
+)
 
 # Get full eBird taxonomy (cached globally since it doesn't depend on region/user)
 sp_all <- with_cache(file.path(api_cache_dir, "ebird_taxonomy.rds"), function() {
@@ -85,10 +94,10 @@ sp_user_all <- read.csv(your_ebird_dat) %>%
 # User regional list
 sp_user_region <- read.csv(your_ebird_dat) %>%
   separate(S.P, into = c("country", "state"), sep = "-", remove = FALSE) %>%
-  filter(country == region_info$country)
+  filter(country %in% region_info$country)
 
-if (!is.na(region_info$state)) {
-  sp_user_region <- filter(sp_user_region, S.P == region)
+if (any(!is.na(region_info$state))) {
+  sp_user_region <- filter(sp_user_region, S.P %in% region)
 }
 
 sp_user_region <- sp_user_region %>%
@@ -98,9 +107,10 @@ sp_user_region <- sp_user_region %>%
   filter(category == "species")
 
 # All species observed in region (by anyone) - cached per region
-sp_region <- with_cache(file.path(api_cache_dir, paste0("region_species_", region, ".rds")), function() {
-  ebirdregionspecies(region) %>%
-    left_join(sp_all) %>%
+sp_region <- with_cache(file.path(api_cache_dir, paste0("region_species_", region_id, ".rds")), function() {
+  map_dfr(region, ebirdregionspecies) %>%
+    distinct(speciesCode) %>%
+    left_join(sp_all, by = c("speciesCode" = "speciesCode")) %>%
     drop_na(Common.Name)
 })
 
@@ -150,6 +160,12 @@ species_files_present <- function(sp_code) {
       return(FALSE)
     }
   }
+  if (download_abundance) {
+    abundance_file <- file.path(sp_dir, paste0(sp_code, "_abundance_median_", resolution, "_", ebirdst_version_year, ".tif"))
+    if (!file.exists(abundance_file)) {
+      return(FALSE)
+    }
+  }
   TRUE
 }
 
@@ -162,7 +178,7 @@ for (i in seq_len(n_species_to_download)) {
   }
   message(sprintf("[%d/%d] Ensuring data downloaded for %s", i, n_species_to_download, sp_code))
   ebirdst_download_status(sp_code,
-    download_abundance = TRUE, download_occurrence = TRUE,
+    download_abundance = download_abundance, download_occurrence = TRUE,
     pattern =
       if (annotate == TRUE) {
         paste0("occurrence_median_", resolution, "|", "proportion-population_median_", resolution)
@@ -189,7 +205,7 @@ if (!refresh_cache && file.exists(combined_rasters_path)) {
 } else {
   # Load occurrence rasters for all species in species list
   occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
-  # POC: immediately drop to the first n_weeks layers so the heavy crop/mask/summarize steps below only ever hold n_weeks worth of data in memory
+  # immediately drop to the first n_weeks layers so the heavy crop/mask/summarize steps below only ever hold n_weeks worth of data in memory
   occ_combined <- sapply(occ_combined, terra::subset, subset = 1:n_weeks)
 
   # Load proportion population rasters for all species in species list
@@ -199,13 +215,35 @@ if (!refresh_cache && file.exists(combined_rasters_path)) {
   }
 
   # Vector data for region (country/state polygons)
-  study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
-  if (!is.na(region_info$state)) {
-    study_area <- study_area %>% filter(iso_3166_2 == .env$region)
+  if (length(region) > 1) {
+    country_names <- c(
+      MX = "Mexico", BZ = "Belize", GT = "Guatemala", SV = "El Salvador",
+      HN = "Honduras", NI = "Nicaragua", CR = "Costa Rica", PA = "Panama"
+    )
+    country_regions <- region_info %>% filter(is.na(state))
+    state_regions <- region_info %>% filter(!is.na(state))
+    study_area <- list()
+    if (nrow(country_regions) > 0) {
+      study_area[["countries"]] <- ne_countries(
+        country = unname(country_names[country_regions$country]), returnclass = "sf"
+      )
+    }
+    if (nrow(state_regions) > 0) {
+      study_area[["states"]] <- ne_states(
+        iso_a2 = unique(state_regions$country), returnclass = "sf"
+      ) %>%
+        filter(iso_3166_2 %in% state_regions$region)
+    }
+    study_area <- do.call(rbind, study_area)
+  } else {
+    study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
+    if (!is.na(region_info$state)) {
+      study_area <- study_area %>% filter(iso_3166_2 == .env$region)
+    }
+    if (!region %in% c("US-HI", "US-AK")) {
+      study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
+    } # if region is US only mapping continental US
   }
-  if (!region %in% c("US-HI", "US-AK")) {
-    study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
-  } # if region is US only mapping continental US
   study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
   mapview::mapview(study_area)
 
@@ -421,7 +459,7 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
       legend.text.align = 0.5
     )
   week_plot
-  ggsave(filename = here(outputDir, "Weekly_maps", paste0(region, "_", date, ".jpg")), plot = week_plot, bg = "white", height = 5.35, width = 6.6)
+  ggsave(filename = here(outputDir, "Weekly_maps", paste0(region_id, "_", date, ".jpg")), plot = week_plot, bg = "white", height = 5.35, width = 6.6)
   week_plots_possible[[i]] <- week_plot
 }
 
@@ -432,8 +470,8 @@ imgs <- list.files(here(outputDir, "Weekly_maps"), full.names = T)
 lores_frames <- image_join(lapply(imgs, function(f) image_scale(image_read(f), geometry_size_percent(width = 38, height = NULL))))
 if (annotate == TRUE) {img_animated_lores <- image_animate(lores_frames, fps = .5)}
 if (annotate == FALSE) {img_animated_lores <- image_animate(lores_frames, fps = 5)}
-if (annotate == TRUE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_lores_annotated_", user_file, ".gif"))}
-if (annotate == FALSE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_lores_", user_file, ".gif"))}
+if (annotate == TRUE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region_id, "_Animated_map_annual_", theme, "_lores_annotated_", user_file, ".gif"))}
+if (annotate == FALSE) {image_path_lores <- here(outputDir, "Animated_map", paste0(region_id, "_Animated_map_annual_", theme, "_lores_", user_file, ".gif"))}
 image_write(image = img_animated_lores, path = image_path_lores)
 rm(lores_frames, img_animated_lores)
 gc()
@@ -441,8 +479,8 @@ gc()
 if (!requireNamespace("av", quietly = TRUE)) {
   stop("The av package is required to create the hi-res MP4. On Debian/Ubuntu install libavfilter-dev, libavcodec-dev, libavformat-dev, libavutil-dev, libswscale-dev, and libavdevice-dev, then run install.packages('av').")
 }
-if (annotate == TRUE) {image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_annotated_", user_file, ".mp4"))}
-if (annotate == FALSE) {image_path <- here(outputDir, "Animated_map", paste0(region, "_Animated_map_annual_", theme, "_hires_", user_file, ".mp4"))}
+if (annotate == TRUE) {image_path <- here(outputDir, "Animated_map", paste0(region_id, "_Animated_map_annual_", theme, "_hires_annotated_", user_file, ".mp4"))}
+if (annotate == FALSE) {image_path <- here(outputDir, "Animated_map", paste0(region_id, "_Animated_map_annual_", theme, "_hires_", user_file, ".mp4"))}
 if (annotate == TRUE) {fps <- .5}
 if (annotate == FALSE) {fps <- 5}
 av::av_encode_video(

@@ -9,3 +9,11 @@ Data
 sequence
 Scripts/lifer_finder_full_richness.R
 *Weekly_maps/
+# Credentials - keep eBird keys in ~/.Renviron, never in the repo
+.Renviron
+.httr-oauth
+*.key
+
+# Personal eBird data - download from eBird on each machine
+ebird_world_life_list.csv
+MyEBirdData*.csv
