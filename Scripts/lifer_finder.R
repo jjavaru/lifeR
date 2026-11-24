@@ -16,7 +16,7 @@ central_america <- c("MX", "BZ", "GT", "SV", "HN", "NI", "CR", "PA")
 southwest_us <- c("US-AZ", "US-NM", "US-TX")
 
 # Set parameters
-region <- southwest_us # eBird country or state-level regional code(s), e.g. "US", "US-NY", or a vector such as central_america or southwest_us above. Note that "US" is by default modified to only include continental US.
+region <- "US" # eBird country or state-level regional code(s), e.g. "US", "US-NY", or a vector such as central_america or southwest_us above. Note that "US" is by default modified to only include continental US.
 user <- "Jon Javaruski" # e.g., "Sam Safran" - this is typically your full name or username. Controls how you are identified in the map caption and is used in output file structure, so can't be empty.
 user_short <- "Jon" # e.g., "Sam" - optional to customize name in legend. Typically a first name. Leave this defined as NA and it will read "My potential lifers." Haven't figured out how to center name over legend for longer names, so this may not look great.
 your_ebird_dat <- here("ebird_world_life_list.csv") # path to where your personal eBird data are stored
@@ -190,164 +190,176 @@ for (i in seq_len(n_species_to_download)) {
 
 # Define occurrence threshold for when a species is "possible"
 possible_occurrence_threshold <- 0.01 # minimum occurrence probability for a species to be considered "possible" at a given time/location.
+# Everything below turns the downloaded per-species rasters into weekly counts of possible lifers per cell.
+# Species are processed one at a time: each species' raster is read, cropped to the study area, thresholded and
+# added into a running per-cell, per-week count, then discarded. Peak memory is one species plus the count grid,
+# however many species are needed (holding every species at once took >10 GB for the continental US at 27km).
+# The result is checkpointed so reruns skip this loop.
 
-# Everything below combines the downloaded per-species rasters into cropped/masked rasters for the study
-# area. This is expensive, so it's checkpointed as a group - if it already ran, we load the saved result
-# instead of re-loading/re-cropping every species raster.
-combined_rasters_path <- file.path(checkpoint_dir, paste0("combined_rasters_", n_weeks, "wk.rds"))
-if (!refresh_cache && file.exists(combined_rasters_path)) {
-  message("Using cached cropped rasters: ", combined_rasters_path)
-  cached_combined <- readRDS(combined_rasters_path)
-  occ_crop_combined <- lapply(cached_combined$occ_crop_combined, terra::unwrap)
-  if (annotate == TRUE) prop_crop_combined <- lapply(cached_combined$prop_crop_combined, terra::unwrap)
-  sp_ebst_for_run_in_region <- cached_combined$sp_ebst_for_run_in_region
-  study_area <- cached_combined$study_area
+# Study area polygons (country/state outlines) used for masking and for the map borders
+if (length(region) > 1) {
+  country_regions <- region_info %>% filter(is.na(state))
+  state_regions <- region_info %>% filter(!is.na(state))
+  study_area <- list()
+  if (nrow(country_regions) > 0) {
+    # iso_a2_eh rather than iso_a2: Natural Earth sets iso_a2 to "-99" for a few countries (e.g. France, Norway)
+    # scale = "large" (1:10m, from rnaturalearthhires) matches the detail of ne_states(); the default 1:110m
+    # outlines drop small islands and straighten coastlines, which also changes which cells get masked.
+    countries <- ne_countries(scale = "large", returnclass = "sf") %>%
+      filter(iso_a2_eh %in% country_regions$country) %>%
+      # A code can also match small dependencies (e.g. FR matches Clipperton I. in the Pacific), which would
+      # stretch the crop extent; use them only when the code has no main country row (e.g. PR, Puerto Rico).
+      group_by(iso_a2_eh) %>%
+      filter(type != "Dependency" | all(type == "Dependency")) %>%
+      ungroup()
+    missing_countries <- setdiff(country_regions$country, countries$iso_a2_eh)
+    if (length(missing_countries) > 0) {
+      stop("No Natural Earth country outline found for: ", paste(missing_countries, collapse = ", "))
+    }
+    study_area[["countries"]] <- st_sf(geometry = st_geometry(countries))
+  }
+  if (nrow(state_regions) > 0) {
+    states <- ne_states(iso_a2 = unique(state_regions$country), returnclass = "sf") %>%
+      filter(iso_3166_2 %in% state_regions$region)
+    study_area[["states"]] <- st_sf(geometry = st_geometry(states))
+  }
+  study_area <- do.call(rbind, unname(study_area))
 } else {
-  # Load occurrence rasters for all species in species list
-  occ_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "occurrence", period = "weekly", metric = "median", resolution = resolution)
-  # immediately drop to the first n_weeks layers so the heavy crop/mask/summarize steps below only ever hold n_weeks worth of data in memory
-  occ_combined <- sapply(occ_combined, terra::subset, subset = 1:n_weeks)
-
-  # Load proportion population rasters for all species in species list
-  if (annotate == TRUE) {
-    prop_combined <- sapply(sp_ebst_for_run$species_code, load_raster, product = "proportion-population", period = "weekly", metric = "median", resolution = resolution)
-    prop_combined <- sapply(prop_combined, terra::subset, subset = 1:n_weeks)
+  study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
+  if (!is.na(region_info$state)) {
+    study_area <- study_area %>% filter(iso_3166_2 == .env$region)
   }
+  if (!region %in% c("US-HI", "US-AK")) {
+    study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
+  } # if region is US only mapping continental US
+}
 
-  # Vector data for region (country/state polygons)
-  if (length(region) > 1) {
-    country_names <- c(
-      MX = "Mexico", BZ = "Belize", GT = "Guatemala", SV = "El Salvador",
-      HN = "Honduras", NI = "Nicaragua", CR = "Costa Rica", PA = "Panama"
-    )
-    country_regions <- region_info %>% filter(is.na(state))
-    state_regions <- region_info %>% filter(!is.na(state))
-    study_area <- list()
-    if (nrow(country_regions) > 0) {
-      study_area[["countries"]] <- ne_countries(
-        country = unname(country_names[country_regions$country]), returnclass = "sf"
-      )
-    }
-    if (nrow(state_regions) > 0) {
-      study_area[["states"]] <- ne_states(
-        iso_a2 = unique(state_regions$country), returnclass = "sf"
-      ) %>%
-        filter(iso_3166_2 %in% state_regions$region)
-    }
-    study_area <- do.call(rbind, study_area)
-  } else {
-    study_area <- ne_states(iso_a2 = region_info$country, returnclass = "sf")
-    if (!is.na(region_info$state)) {
-      study_area <- study_area %>% filter(iso_3166_2 == .env$region)
-    }
-    if (!region %in% c("US-HI", "US-AK")) {
-      study_area <- filter(study_area, !iso_3166_2 %in% c("US-HI", "US-AK"))
-    } # if region is US only mapping continental US
-  }
-  study_area <- st_transform(study_area, st_crs(occ_combined[[1]]))
+# Loads a species' weekly raster, keeping only the first n_weeks layers
+load_weekly <- function(sp_code, product = "occurrence") {
+  r <- load_raster(sp_code, product = product, period = "weekly", metric = "median", resolution = resolution)
+  terra::subset(r, 1:n_weeks)
+}
+
+lifer_counts_path <- file.path(checkpoint_dir, paste0("lifer_counts_", n_weeks, "wk.rds"))
+if (!refresh_cache && file.exists(lifer_counts_path)) {
+  message("Using cached lifer counts: ", lifer_counts_path)
+  cached <- readRDS(lifer_counts_path)
+  lifer_counts <- terra::unwrap(cached$lifer_counts)
+  sp_ebst_for_run_in_region <- cached$sp_ebst_for_run_in_region
+  study_area <- cached$study_area
+  week_names <- cached$week_names
+  if (annotate == TRUE) polys <- cached$polys
+} else {
+  sp_codes <- sp_ebst_for_run$species_code
+
+  # The first species defines the cropped grid that every other species is checked against
+  first_sp <- load_weekly(sp_codes[1])
+  study_area <- st_transform(study_area, st_crs(first_sp))
   mapview::mapview(study_area)
+  study_vect <- terra::vect(study_area)
+  template <- terra::crop(first_sp, study_vect)
+  week_names <- names(template)
+  rm(first_sp)
 
-  # Function used to drop rasters for species that do not meet occ threshold. This is to help save resources by filtering them out and not processing their layers.
-  filter_rasters_to_sp_above_threshold <- function(z) {
-    sp_above_occ_threhsold <- sapply(z, minmax) %>%
-      apply(2, max) %>%
-      as.data.frame() %>%
-      rownames_to_column("species_code") %>%
-      rename("max_val" = ".") %>%
-      left_join(sp_ebst_for_run) %>%
-      filter(max_val > possible_occurrence_threshold) %>%
-      pull(species_code)
-    z <- z[names(z) %in% sp_above_occ_threhsold]
-    z
+  # Cells of the cropped grid inside the study area polygons (the same cells terra::mask keeps). Only these
+  # cells are counted; everything outside ends up NA, as masking each species did before.
+  in_area <- which(!is.na(terra::values(terra::mask(terra::init(template[[1]], 1), study_vect), mat = FALSE)))
+
+  # counts: number of species above the occurrence threshold per cell and week.
+  # has_data: whether any counted species had a non-NA value there, so cells with no data at all stay NA
+  # (transparent on the map) instead of showing as 0.
+  counts <- matrix(0L, nrow = length(in_area), ncol = n_weeks)
+  has_data <- matrix(FALSE, nrow = length(in_area), ncol = n_weeks)
+  sp_max <- setNames(rep(NA_real_, length(sp_codes)), sp_codes)
+  polys <- list()
+
+  for (s in seq_along(sp_codes)) {
+    sp_code <- sp_codes[s]
+    if (s %% 25 == 0 || s == length(sp_codes)) message(sprintf("Counting species %d/%d", s, length(sp_codes)))
+    occ <- if (s == 1) template else terra::crop(load_weekly(sp_code), study_vect)
+    if (!terra::compareGeom(occ, template, lyrs = TRUE, stopOnError = FALSE)) {
+      stop("Raster grid for ", sp_code, " does not match the other species")
+    }
+    vals <- terra::values(occ, mat = TRUE)[in_area, , drop = FALSE]
+    sp_max[s] <- suppressWarnings(max(vals, na.rm = TRUE))
+
+    # Species that never reach the threshold anywhere in the study area are skipped, as before
+    if (!is.finite(sp_max[s]) || sp_max[s] <= possible_occurrence_threshold) next
+    known <- !is.na(vals)
+    has_data <- has_data | known
+    counts <- counts + (known & vals > possible_occurrence_threshold)
+
+    # For annotations: the cell with the highest share of the population, for each week
+    if (annotate == TRUE) {
+      prop <- terra::mask(terra::crop(load_weekly(sp_code, "proportion-population"), study_vect), study_vect)
+      if (isTRUE(max(terra::values(prop), na.rm = TRUE) > possible_occurrence_threshold)) {
+        max_val_cells <- where.max(prop, values = TRUE, list = FALSE) %>%
+          as.data.frame() %>%
+          filter(value > 0)
+        max_val_coords <- xyFromCell(prop, max_val_cells[, 2])
+        polys[[sp_code]] <- st_as_sf(max_val_coords %>% as.data.frame(), coords = c(1, 2), crs = crs(prop)) %>%
+          mutate(
+            week = max_val_cells[, 1],
+            sp = sp_code,
+            max_weekly_proportion = max_val_cells[, 3]
+          )
+      }
+      rm(prop)
+    }
+    rm(occ, vals, known)
+    if (s %% 25 == 0) gc()
   }
 
-  # Crop the rasters using the vector extent
-  occ_crop_combined <- sapply(occ_combined, terra::crop, y = terra::vect(study_area))
-  occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-  occ_crop_combined <- sapply(occ_crop_combined, terra::mask, mask = terra::vect(study_area))
-  occ_crop_combined <- filter_rasters_to_sp_above_threshold(occ_crop_combined) # drop species not meeting threshold
-  # occ_crop_combined <- sapply(occ_crop_combined, terra::trim)
+  # Turn the count matrix back into a raster on the cropped grid
+  counts[!has_data] <- NA
+  count_vals <- matrix(NA_integer_, nrow = terra::ncell(template), ncol = n_weeks)
+  count_vals[in_area, ] <- counts
+  lifer_counts <- terra::rast(template, nlyrs = n_weeks)
+  terra::values(lifer_counts) <- count_vals
+  names(lifer_counts) <- week_names
+  rm(counts, has_data, count_vals, template)
+  gc()
+
+  # Species meeting the occurrence threshold somewhere in the study area
+  sp_ebst_for_run_in_region <- tibble(species_code = names(sp_max), max_val = unname(sp_max)) %>%
+    filter(is.finite(max_val), max_val > possible_occurrence_threshold) %>%
+    left_join(sp_ebst_for_run, by = "species_code")
 
   if (annotate == TRUE) {
-    prop_crop_combined <- sapply(prop_combined, terra::crop, y = terra::vect(study_area))
-    prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
-    prop_crop_combined <- sapply(prop_crop_combined, terra::mask, mask = terra::vect(study_area))
-    prop_crop_combined <- filter_rasters_to_sp_above_threshold(prop_crop_combined) # drop species not meeting threshold
+    polys <- do.call("rbind", unname(polys)) %>%
+      left_join(sp_ebst_for_run_in_region, by = c("sp" = "species_code"))
+    polys <- st_filter(polys, study_area)
   }
-
-  # New version of species data frame with only species meeting occ threshold
-  sp_ebst_for_run_in_region <- left_join(
-    x = sapply(occ_crop_combined, minmax) %>%
-      apply(2, max) %>%
-      data.frame() %>%
-      rownames_to_column("species_code") %>%
-      rename("max_val" = "."),
-    y = sp_ebst_for_run
-  )
 
   saveRDS(
     list(
-      occ_crop_combined = lapply(occ_crop_combined, terra::wrap),
-      prop_crop_combined = if (annotate == TRUE) lapply(prop_crop_combined, terra::wrap) else NULL,
+      lifer_counts = terra::wrap(lifer_counts),
       sp_ebst_for_run_in_region = sp_ebst_for_run_in_region,
-      study_area = study_area
+      study_area = study_area,
+      week_names = week_names,
+      polys = if (annotate == TRUE) polys else NULL
     ),
-    combined_rasters_path
+    lifer_counts_path
   )
 }
+message(sprintf("%d of %d needed species reach the occurrence threshold in the study area", nrow(sp_ebst_for_run_in_region), nrow(sp_ebst_for_run)))
 
-# Function for viewing summarized species rasters (not run)
+# Function for viewing a species' maximum occurrence across the year (not run)
 view_sp <- function(x) {
-  sp_max <- (raster::raster(max(occ_crop_combined[[x]])))
-  mapview::mapview(sp_max)
+  sp_max_occ <- max(terra::crop(load_weekly(x), terra::vect(study_area)))
+  mapview::mapview(raster::raster(sp_max_occ))
 }
 # view_sp("casspa")
 
-# Sum number of "possible" species in each cell based on occurrence probability and the defined threshold. Each
-# week stored as a single-layer SpatRaster in a list. This is checkpointed since it's a heavy per-week loop.
+# Reproject, mask, and trim each week's lifer count raster for plotting. Checkpointed separately.
 possible_lifers <- with_raster_cache(file.path(checkpoint_dir, paste0("possible_lifers_", n_weeks, "wk.rds")), function() {
-  possible_lifers <- list()
-  for (i in 1:n_weeks) {
-    message(sprintf("Summarizing week %d/%d", i, n_weeks))
-    week_slice <- lapply(occ_crop_combined, subset, subset = i)
-    week_slice <- rast(week_slice)
-    week_slice <- ifel(week_slice > possible_occurrence_threshold, 1, 0)
-    week_slice <- sum(week_slice, na.rm = TRUE)
-    possible_lifers[[i]] <- week_slice
-  }
-
-  # Reproject, mask, and trim weekly lifer count rasters for plotting
-  possible_lifers <- sapply(possible_lifers, terra::project, y = "epsg:5070", method = "near")
-  possible_lifers <- sapply(possible_lifers, terra::mask, mask = project(vect(study_area), y = "epsg:5070"))
-  possible_lifers <- sapply(possible_lifers, trim)
-  possible_lifers
+  study_vect_5070 <- project(vect(study_area), y = "epsg:5070")
+  lapply(seq_len(n_weeks), function(i) {
+    week <- terra::project(lifer_counts[[i]], y = "epsg:5070", method = "near")
+    week <- terra::mask(week, mask = study_vect_5070)
+    trim(week)
+  })
 })
-
-# For each species and each week get point of highest abundance and add to an sf dataframe (for annotations)
-if (annotate == TRUE) {
-  polys <- st_sf(geometry = st_sfc(lapply(1:1, function(x) st_geometrycollection())), week = NA, sp = NA)
-  polys <- st_set_crs(polys, crs(prop_crop_combined[[1]]))
-  # polys <- data.frame(wk = 1:52, sp = NA)
-  polys <- list()
-  for (s in 1:length(prop_crop_combined)) {
-    sp <- names(prop_crop_combined[s])
-    max_val_cells <- where.max(prop_crop_combined[[sp]], values = TRUE, list = FALSE) %>%
-      as.data.frame() %>%
-      filter(value > 0)
-    max_val_coords <- xyFromCell(prop_crop_combined[[sp]], max_val_cells[, 2])
-    max_val_sf <- st_as_sf(max_val_coords %>% as.data.frame(), coords = c(1, 2), crs = crs(prop_crop_combined[[1]])) %>%
-      mutate(
-        week = max_val_cells[, 1],
-        sp = sp,
-        max_weekly_proportion = max_val_cells[, 3]
-      )
-    polys[[s]] <- max_val_sf
-  }
-  polys <- do.call("rbind", polys) %>%
-    left_join(sp_ebst_for_run_in_region, by = c("sp" = "species_code"))
-
-  polys <- st_filter(polys, study_area)
-}
 
 # Generate weekly maps
 # Set theme colors
@@ -385,9 +397,8 @@ legend_labels <- labels(legend_breaks)
 legend_breaks_last <- last(legend_breaks)
 
 # Generate and save map for each week.
-week_plots_possible <- list()
 for (i in 1:length(possible_lifers)) {
-  date <- terra::names(occ_crop_combined[[1]])[i]
+  date <- week_names[i]
   if (needs_list_to_use == "global") {
     legend_lab <- paste0(ifelse(is.na(user_short), paste0("My"), paste0(user_short, "'s")), " potential lifers")
   }
@@ -427,7 +438,7 @@ for (i in 1:length(possible_lifers)) {
       # subtitle = "Mapping the birds you've yet to meet",
       fill = legend_lab,
       caption = paste0("Lifers mapped for: ", user, ". \nLifer analysis and map by Sam Safran.\nA candidate lifer is considered `possible` if the species has a >", round(possible_occurrence_threshold * 100, 0), "% modeled occurrence probability at the location and date.\n
-Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, I. Davies, A. Rodewald, V. Ruiz-Gutierrez, C. Wood. 2023. eBird Status and Trends, Data Version:\n2022; Released: 2023. Cornell Lab of Ornithology, Ithaca, New York. https://doi.org/10.2173/ebirdst.2022. This material uses data from the eBird Status and Trends\n Project at the Cornell Lab of Ornithology, eBird.org. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s)\nand do not necessarily reflect the views of the Cornell Lab of Ornithology.")
+Data from 2023 eBird Status & Trends products (https://ebird.org/science/status-and-trends): Fink, D., T. Auer, A. Johnston, M. Strimas-Mackey, S. Ligocki, O. Robinson,\n W. Hochachka, L. Jaromczyk, C. Crowley, K. Dunham, A. Stillman, C. Davis, M. Stokowski, P. Sharma, V. Pantoja, D. Burgin, P. Crowe, M. Bell, S. Ray, I. Davies,\nV. Ruiz-Gutierrez, C. Wood, A. Rodewald. 2024. eBird Status and Trends, Data Version: 2023; Released: 2025. Cornell Lab of Ornithology, Ithaca, New York.\nhttps://doi.org/10.2173/WZTW8903. This material uses data from the eBird Status and Trends Project at the Cornell Lab of Ornithology, eBird.org.\nAny opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the\nCornell Lab of Ornithology.")
     ) +
     ggthemes::theme_fivethirtyeight() +
     theme(
@@ -460,7 +471,6 @@ Data from 2022 eBird Status & Trends products (https://ebird.org/science/status-
     )
   week_plot
   ggsave(filename = here(outputDir, "Weekly_maps", paste0(region_id, "_", date, ".jpg")), plot = week_plot, bg = "white", height = 5.35, width = 6.6)
-  week_plots_possible[[i]] <- week_plot
 }
 
 # Generate a low-resolution GIF and a high-resolution MP4.
